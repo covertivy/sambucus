@@ -1,16 +1,19 @@
 from uuid import UUID
+from typing import List
 
 from impacket import nmb
 from impacket import smb, smb3, smb3structs
 from impacket.smbconnection import SMBConnection
+from impacket.dcerpc.v5 import transport, srvs
 
-from sambucus.io import console
+from sambucus import io
 from sambucus.lib.utils import filetime_to_dt
 from sambucus.lib.target import TargetConnection, TargetAuthentication
 from sambucus.smb.smb3 import SambucusSMB3
+from sambucus.smb.structs.shares import ShareInformation, parse_shares_enumeration_info
 
 
-class SambucusConnection(SMBConnection):
+class SambucusSMBConnection(SMBConnection):
     def __init__(self, target_con: TargetConnection, target_auth: TargetAuthentication):
         super().__init__(
             remoteName=target_con.remote_name, 
@@ -22,49 +25,15 @@ class SambucusConnection(SMBConnection):
             manualNegotiate=True
         )
         
-        self._compression = target_con.compression
-        self._unicode = target_con.unicode
+        self._target_con: TargetConnection = target_con
+        self._target_auth: TargetAuthentication = target_auth
         
-        with console.status("Negotiating SMB Session with remote host...") as s:
-            self.negotiateSession(
-                self._preferredDialect,
-                flags1=smb.SMB.FLAGS1_PATHCASELESS | smb.SMB.FLAGS1_CANONICALIZED_PATHS,
-                flags2=smb.SMB.FLAGS2_EXTENDED_SECURITY | \
-                        smb.SMB.FLAGS2_NT_STATUS | \
-                        smb.SMB.FLAGS2_LONG_NAMES | \
-                        smb.SMB.FLAGS2_COMPRESSED if self._compression else 0 | \
-                        smb.SMB.FLAGS2_UNICODE if self._unicode else 0
-            )
-        with console.status("Authenticating to Remote Server") as s:
-            if target_auth.kerberos:
-                self.kerberosLogin(
-                    target_auth.username,
-                    target_auth.password,
-                    target_auth.domain,
-                    target_auth.lmhash,
-                    target_auth.nthash,
-                    target_auth.aesKey,
-                    target_auth.kdc_host,
-                    target_auth.tgt,
-                    target_auth.tgs,
-                    target_auth.useCache,
-                )
-            else:
-                self.login(
-                    target_auth.username,
-                    target_auth.password,
-                    target_auth.domain,
-                    target_auth.lmhash,
-                    target_auth.nthash,
-                )
-        if self.isGuestSession() > 0:
-            console.log("GUEST Session Granted")
-        else:
-            console.log("USER Session Granted")
-        
-        
-        console.log("Target Server Information:")
-        console.log(
+        self.connect()
+        self.repr_server_information()
+    
+    def repr_server_information(self) -> None:
+        io.console.log("Target Server Information:")
+        io.console.log(
             "{host} {name} (os: {sever_os}) (domain: {domain})".format(
                 host=self.getRemoteHost(),
                 name=self.getServerDNSHostName(),
@@ -72,8 +41,86 @@ class SambucusConnection(SMBConnection):
                 domain=f"{self.getServerDomain()} / {self.getServerDNSDomainName()}",
             )
         )
-        console.log(f"Target Server Time: {filetime_to_dt(self._SMBConnection._Connection.get('SystemTime')).isoformat(sep=' ')}")
-        console.log(f"Target Server GUID: {UUID(bytes_le=self._SMBConnection._Connection.get('ServerGuid'))}")
+        io.console.log(f"Target Server Time: {filetime_to_dt(self._SMBConnection._Connection.get('SystemTime')).isoformat(sep=' ')}")
+        io.console.log(f"Target Server GUID: {UUID(bytes_le=self._SMBConnection._Connection.get('ServerGuid'))}")
+    
+    def connect(self) -> None:
+        with io.console.status("Negotiating SMB Session with remote host...") as s:
+            self.negotiateSession(
+                self._preferredDialect,
+                flags1=smb.SMB.FLAGS1_PATHCASELESS | smb.SMB.FLAGS1_CANONICALIZED_PATHS,
+                flags2=smb.SMB.FLAGS2_EXTENDED_SECURITY | \
+                        smb.SMB.FLAGS2_NT_STATUS | \
+                        smb.SMB.FLAGS2_LONG_NAMES | \
+                        smb.SMB.FLAGS2_COMPRESSED if self._target_con.compression else 0 | \
+                        smb.SMB.FLAGS2_UNICODE if self._target_con.unicode else 0
+            )
+        with io.console.status("Authenticating to Remote Server") as s:
+            if self._target_auth.kerberos:
+                self.kerberosLogin(
+                    self._target_auth.username,
+                    self._target_auth.password,
+                    self._target_auth.domain,
+                    self._target_auth.lmhash,
+                    self._target_auth.nthash,
+                    self._target_auth.aes_key,
+                    self._target_auth.kdc_host,
+                    self._target_auth.tgt,
+                    self._target_auth.tgs,
+                    self._target_auth.use_cache,
+                )
+            else:
+                self.login(
+                    self._target_auth.username,
+                    self._target_auth.password,
+                    self._target_auth.domain,
+                    self._target_auth.lmhash,
+                    self._target_auth.nthash,
+                )
+        if self.isGuestSession() > 0:
+            io.console.log("GUEST Session Granted")
+        else:
+            io.console.log("USER Session Granted")
+    
+    def listShares(self, level: int = 1) -> List[ShareInformation]:
+        """
+        get a list of available shares at the connected target.
+
+        Available Levels of Enumeration:
+            0: ('Level0', LPSHARE_INFO_0_CONTAINER),
+            1: ('Level1', LPSHARE_INFO_1_CONTAINER),
+            2: ('Level2', LPSHARE_INFO_2_CONTAINER),
+            501: ('Level501', LPSHARE_INFO_501_CONTAINER),
+            502: ('Level502', LPSHARE_INFO_502_CONTAINER),
+            503: ('Level503', LPSHARE_INFO_503_CONTAINER),
+
+        :return: a list containing dict entries for each share
+        :raise SessionError: if error
+        """
+        # Get the shares through RPC
+        
+        try:
+            rpctransport = transport.SMBTransport(
+                self.getRemoteName(), 
+                self.getRemoteHost(), 
+                filename=r'\srvsvc',
+                smb_connection=self
+            )
+            dce = rpctransport.get_dce_rpc()
+            dce.connect()
+            dce.bind(srvs.MSRPC_UUID_SRVS)
+            
+            resp = srvs.hNetrShareEnum(dce, level, serverName="\\\\" + self.getRemoteHost())
+        except Exception as err:
+            if "INVALID_LEVEL" in str(err) or "ACCESS_DENIED" in str(err):
+                io.console.log(f"Could not enumerate shares with {level =}, Falling Back to level = 1!")
+                resp = srvs.hNetrShareEnum(dce, 1, serverName="\\\\" + self.getRemoteHost()) # Fallback To Enum Level = 1
+            else:
+                io.console.log(f"Error: {str(err)}")
+        finally:
+            dce.disconnect()
+        
+        return parse_shares_enumeration_info(resp)
     
     def negotiateSession(self, preferredDialect=None,
                          flags1=smb.SMB.FLAGS1_PATHCASELESS | smb.SMB.FLAGS1_CANONICALIZED_PATHS,
@@ -130,7 +177,7 @@ class SambucusConnection(SMBConnection):
                 self._SMBConnection = smb.SMB(self._remoteName, self._remoteHost, self._myName, hostType,
                                               self._sess_port, self._timeout)
             elif preferredDialect in [smb3structs.SMB2_DIALECT_002, smb3structs.SMB2_DIALECT_21, smb3structs.SMB2_DIALECT_30, smb3structs.SMB2_DIALECT_311]:
-                self._SMBConnection = smb3.SambucusSMB3(self._remoteName, self._remoteHost, self._myName, hostType,
+                self._SMBConnection = SambucusSMB3(self._remoteName, self._remoteHost, self._myName, hostType,
                                                 self._sess_port, self._timeout, preferredDialect=preferredDialect)
             else:
                 raise Exception("Unknown dialect %s")
