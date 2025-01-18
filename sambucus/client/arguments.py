@@ -135,6 +135,9 @@ def parse_args(arguments: argparse.Namespace) -> Tuple[TargetConnection, TargetA
         else:
             lmhash, nthash = arguments.hashes.split(':')
     
+    if arguments.dialect and arguments.dialect.isnumeric():
+        arguments.dialect = int(arguments.dialect)
+    
     return TargetConnection(
         remote_host=arguments.target_ip,
         remote_name=address,
